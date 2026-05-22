@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dynamic Skill Router"
+  short_description: "Route multi-part tasks to temporary skills"
+  default_prompt: "Use $dynamic-skill-router to split a request into parts, find the highest-install relevant skill for each part on skills.sh, use those skills temporarily, and clean them up afterward."
