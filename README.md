@@ -1,54 +1,79 @@
-# Dynamic Skill Router
+# fuck-skills
 
-一个把复杂请求自动拆分、选 skill、临时安装、执行再清理的动态技能路由器。
+一个专门用来狠狠干碎“技能太多、任务太杂、路由太乱”问题的动态 Skill Router。
 
-`dynamic-skill-router` 不是一个面向单一领域的 skill，
-而是一个专门给 Agent / Codex 使用的 **skill 编排器**：
-它会把一个复杂请求拆成多个能力片段，为每个片段从 `skills.sh` 里挑选最合适的社区 skill，按需安装，能复用就复用，最后再安全清理。
+如果你已经受够了这些场景：
 
-## 这个 skill 解决了什么问题
+- 一个需求要 review、要测试、要文档、要部署，结果不知道该上哪个 skill
+- skill 装了一堆，真正要用的时候反而更乱
+- Agent 看起来很聪明，实际一到复杂任务就开始乱选 skill、乱装 skill、乱清理 skill
+- 临时装 skill 容易，清理干净很难
 
-真实世界里的请求，往往不是“一个任务，一个 skill”。
+那这个项目就是冲着这些痛点来的。
 
-比如用户可能会这样说：
+`fuck-skills` 不是普通的 skill。
+它是一个 **专门调度 skill 的 skill**。
 
-- 先帮我 review 一下 PR
-- 再补测试
-- 再写 changelog
+它做的事情非常直接：
+
+> 把复杂请求拆开，给每一段任务找最合适的 skill，只装该装的，只用该用的，用完就收，绝不让 skill 生态继续失控。
+
+---
+
+## 这玩意儿到底是什么
+
+`fuck-skills` 是一个面向 Codex / Agent 工作流的动态技能路由器。
+
+它会：
+
+- 把一个复杂请求拆成多个有顺序的能力 part
+- 判断哪些 part 值得用外部 skill
+- 去 `skills.sh` 搜索候选 skill
+- 按 **相关性优先、热度次之** 的规则选 skill
+- 如果前面已经选过的 skill 还能覆盖后面的 part，就直接复用
+- 临时安装 skill
+- 执行完之后安全移除
+
+一句话：
+
+> 它不是让你“多装几个 skill 试试看”，而是让 skill 真正变成一个可控、可编排、可回收的工具系统。
+
+---
+
+## 为什么这个项目很猛
+
+因为它不是在修小毛病。
+它直接解决的是 Agent skill 生态里最烦、最脏、最容易失控的那一层：
+
+### 1. 复杂任务不该只靠一个 skill 硬顶
+真实需求从来不是一句话就能处理干净的。
+
+用户经常会说：
+
+- 帮我 review 这个 PR
+- 顺手把测试补了
+- 再写 release notes
 - 最后给我一份部署建议
 
-如果长期预装大量 skill，会带来几个问题：
+普通 skill 面对这种任务，往往只有两种死法：
 
-- 环境臃肿
-- skill 太多，不知道该用哪个
-- 不同任务之间上下文污染
-- 清理困难
+- 要么能力不够，处理一半就废了
+- 要么太泛，什么都沾一点但什么都不够准
 
-`dynamic-skill-router` 的目标，就是把 skill 的使用方式变成：
+`fuck-skills` 的做法很狠：
 
-- **按需选择**
-- **按 part 路由**
-- **临时安装**
-- **任务结束后清理**
+> 不让一个 skill 硬吃所有任务，而是把任务拆开，让每个 part 去找最适合自己的 skill。
 
-## 核心能力
+### 2. 它不信“最火的 skill”，它信“最对的 skill”
+很多系统的问题是：
 
-### 1. 多阶段任务拆分
-它会把一个用户请求拆成有顺序的 part，而不是粗暴地让一个 skill 处理所有事情。
+- 只按安装量排序
+- 只看热度
+- 只看模糊命中
 
-适合的能力类别包括：
+结果选出来的 skill 看起来很火，实际上根本不对题。
 
-- review
-- testing
-- deployment
-- documentation
-- refactor
-- analysis
-- migration
-- integration
-
-### 2. 相关性优先的 skill 选择
-候选 skill 的排序规则不是“谁最火谁上”，而是：
+`fuck-skills` 直接采用：
 
 ```text
 (relevance_score, installs_value)
@@ -59,65 +84,70 @@
 - 先看相关性
 - 再看安装量
 
-这意味着它选的是“最热门的相关 skill”，而不是“全站最热门 skill”。
+这意味着它追求的是：
 
-### 3. 自动复用 skill
-如果前面已经选中的某个 skill，仍然能够很好覆盖后面的 part，路由器会直接复用，而不是重复安装新的 skill。
+> 最热门的“相关” skill，而不是最热门的“垃圾泛 skill”。
 
-这样可以减少：
+### 3. 它不是疯狂安装，而是按需借用
+这个项目最爽的一点就在这里：
 
-- 安装次数
-- skill 切换成本
-- 临时 skill 数量
+- 不要求你常驻装几十个 skill
+- 不鼓励你把环境变成技能垃圾场
+- 不让每次任务都把上下文搞得满地都是
 
-### 4. 先预览，再执行
-在安装任何 skill 之前，你可以先执行 `batch-select --dry-run` 预览计划。
+它的哲学非常简单粗暴：
 
-预览里会告诉你：
+> 要用的时候装，不用的时候删。
 
-- 每个 part 选中了哪个 skill
-- 哪些 skill 会新安装
-- 哪些 skill 已经存在
-- 哪些 part 会 fallback
-- 哪些 part 会复用已有 skill
+### 4. 它连“乱清理”这件事都狠狠干掉了
+很多路由器项目最危险的地方不是“装错”，而是“删错”。
 
-### 5. 更安全的安装与清理
-这个项目已经做了安全收敛：
+这个项目已经做了很关键的安全收敛：
 
-- `remove` 优先使用完整 package 引用
-- 同名 skill 歧义场景会拒绝执行，而不是盲删
-- 清理依赖官方 `skills remove`
-- 不再手动删除本地 skill 目录
+- remove 优先按完整 package 精确定位
+- 同名 skill 冲突时，直接拒绝删除，不瞎猜
+- 清理只走 `skills remove`
+- 不再自己手动删本地目录
 
-### 6. 双输出模式
-- 默认输出：适合人类阅读的 CLI 文本格式
-- `--json`：适合自动化调用、Agent 集成、二次编排
+所以它不是“装得猛”，而是：
 
-## 典型使用场景
+> 该猛的时候猛，该稳的时候非常稳。
 
-这个 skill 特别适合下面这类请求：
+---
 
-- 一个需求跨多个专业阶段
-- 你不想永久安装大量社区 skill
-- 你希望让 skill 使用过程更透明、更可控
-- 你希望先预览计划，再决定是否安装
-- 你希望任务结束后安全回收临时 skill
+## 它到底能干什么
 
-## 快速开始
+### 动态拆任务
+把一个复杂请求拆成多个按顺序执行的 part。
 
-### 1. 检查环境
+支持的能力方向包括：
 
-```bash
-python3 scripts/skills_router.py check
-```
+- review
+- testing
+- deployment
+- documentation
+- refactor
+- analysis
+- migration
+- integration
 
-如果你需要结构化输出：
+### 动态找 skill
+对每个 part 生成搜索 query，去 `skills.sh` 搜索候选 skill。
 
-```bash
-python3 scripts/skills_router.py check --json
-```
+### 动态选 skill
+自动评分、排序、过滤，选出最值得装的那个。
 
-### 2. 预览一个多阶段计划
+### 动态复用
+如果一个 skill 还能打多个 part，就不重复安装。
+
+### 动态清理
+任务做完，安全 remove。
+
+---
+
+## 使用体验有多顺
+### 先预览，不盲装
+你可以先 dry-run，看看整个计划是不是靠谱。
 
 ```bash
 python3 scripts/skills_router.py batch-select \
@@ -141,17 +171,30 @@ fallback_parts=p3
 reused_parts=-
 ```
 
-### 3. 安装一个选中的 skill
+这个输出的意思很直接：
+
+- 第一段任务该用哪个 skill
+- 第二段任务该用哪个 skill
+- 第三段如果没有强候选，就 fallback
+- 哪些 skill 会被新装
+- 哪些 skill 已经存在
+- 哪些 part 会复用
+
+### 需要就装
 
 ```bash
 python3 scripts/skills_router.py install "warpdotdev/common-skills@review-pr"
 ```
 
-### 4. 使用完成后清理
+### 用完就删
 
 ```bash
 python3 scripts/skills_router.py remove "warpdotdev/common-skills@review-pr"
 ```
+
+简洁、干净、没有废动作。
+
+---
 
 ## 常用命令
 
@@ -169,7 +212,7 @@ python3 scripts/skills_router.py search "pr review"
 python3 scripts/skills_router.py search-many --query "pr review" --query "code review"
 ```
 
-### 为单个 part 选 skill
+### 单 part 选 skill
 
 ```bash
 python3 scripts/skills_router.py select \
@@ -186,7 +229,7 @@ python3 scripts/skills_router.py batch-select \
   --dry-run
 ```
 
-### 安装 / 删除 / 查看已安装 skill
+### 安装 / 删除 / 查看已安装
 
 ```bash
 python3 scripts/skills_router.py install "owner/repo@skill-name"
@@ -194,15 +237,19 @@ python3 scripts/skills_router.py remove "owner/repo@skill-name"
 python3 scripts/skills_router.py list
 ```
 
-## 输出说明
+---
+
+## 输出模式
 
 ### 文本模式
-默认输出为适合人类阅读的文本格式，适合直接在命令行里看结果。
+默认输出就是给人看的。
+
+不带 `--json` 时，CLI 输出会尽量简洁、直接、可扫读。
 
 ### JSON 模式
-如果你要把这个 router 集成到其它 agent、workflow 或脚本中，请使用 `--json`。
+如果你要把 `fuck-skills` 接到别的 Agent、workflow、脚本里，直接加 `--json`。
 
-重要字段包括：
+关键字段包括：
 
 - `selected`
 - `candidates`
@@ -213,34 +260,51 @@ python3 scripts/skills_router.py list
 - `reused`
 - `reused_from_package`
 
-## 安全设计
+---
 
-这个项目目前已经做了几项关键安全收敛：
+## 安全设计：这项目不是瞎搞的
 
-- 优先使用最小相关 skill，而不是盲目安装多个 skill
-- `remove` 支持 package 精确定位
-- 同名 skill 冲突时直接报错，不做猜测删除
-- 清理动作完全依赖 `skills remove`
-- 输入 part 会先做结构校验
-- 没有强候选时允许 fallback，不强装 skill
+它现在已经做了这些关键保护：
 
-## 当前已完成的真实验证
+- part 输入先校验，不让脏数据直接进主流程
+- 同名 skill 冲突时拒绝 remove-by-name
+- cleanup 不再手动删本地目录
+- 没有强候选时允许 fallback
+- 优先最小、最相关 skill，而不是瞎装一堆
+- 支持 dry-run 预览，先看清楚再动手
 
-这个 skill 已经做过真实链路验证：
+换句话说：
 
-- `batch-select --dry-run` 能真实从 `skills.sh` 选出 skill
-- 真实执行过 `install`
-- 能读取已安装 skill 的 `SKILL.md`
-- 真实执行过 `remove`
-- remove 后已通过 `list` 确认 skill 已消失
+> 它不是一个“看起来很会装 skill”的项目，
+> 而是一个“真正在控制 skill 风险”的项目。
 
-此外还补了：
+---
+
+## 现在它已经验证到什么程度了
+
+不是纸上谈兵。
+
+这个项目已经真实跑过：
+
+- `batch-select --dry-run` 真实从 `skills.sh` 选 skill
+- 真实执行过 install
+- 真实读取过已安装 skill 的 `SKILL.md`
+- 真实执行过 remove
+- remove 后已通过 `list` 验证 skill 确实消失
+
+同时还补了：
 
 - 单元测试
-- 输入校验测试
+- part 输入校验测试
 - summary 预览测试
 - install / remove / check 分支测试
-- 文本输出格式测试
+- 文本输出测试
+- 真实链路中的识别 bug 修复
+
+所以它现在不是一个“看起来挺有想法”的 demo，
+而是一个已经能真正上手用的 skill。
+
+---
 
 ## 项目结构
 
@@ -252,36 +316,45 @@ scripts/skills_router.py      路由器实现
 scripts/test_skills_router.py 测试
 ```
 
-## 它适合谁
+---
 
-如果你在做下面这些事情，这个项目会非常适合你：
+## 谁最该用它
+
+如果你正在做这些事情，你会很需要它：
 
 - 做一个基于 Codex 的 skill 生态
 - 做一个支持临时借用 skill 的 Agent
-- 做 review / test / docs / deploy 的任务编排层
-- 不想永久装很多 skill，但又想在复杂任务中灵活调用它们
+- 做 review / testing / docs / deploy 的任务编排层
+- 不想永久安装一大堆 skill，但又想在复杂任务里灵活调用它们
 
-## 这个项目的定位
+---
 
-这不是一个“领域 skill”。
+## 这个项目最准确的定位
 
-它更像一个：
+它不是普通的业务 skill。
 
-> skill orchestration skill
+它更像是：
 
-也就是：
+> 一个专门治理 skill 混乱、清理 skill 膨胀、把复杂任务重新编排干净的 skill orchestration engine。
 
-> 帮 Agent 判断：一个复杂请求该拆成哪些 part、每个 part 应该借哪个 skill、什么时候复用、什么时候清理。
+更直白一点：
 
-## 后续可继续增强的方向
+> 如果你的技能系统已经开始乱了，`fuck-skills` 就是来收拾场子的。
 
-虽然现在已经可以稳定使用，但后面仍然可以继续进化：
+---
+
+## 之后还能继续变得更狠
+
+虽然现在已经能稳定使用，但往后还可以继续进化：
 
 - 把大脚本拆成模块
 - 增加更多集成测试和 E2E 测试
 - 优化长尾 skill 名称的相关性判断
-- 更好地处理近似候选之间的歧义选择
+- 增强相近候选之间的歧义处理
+- 让整个 skill router 更像一个真正的可插拔调度内核
+
+---
 
 ## License
 
-可按你的需要补充许可证信息。
+按你的需要补充许可证即可。
