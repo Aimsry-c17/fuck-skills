@@ -1,9 +1,9 @@
 ---
-name: dynamic-skill-router
+name: fuck-skills
 description: Analyze a user request, decompose it into ordered capability parts, decide which parts need external skills, search skills.sh for each such part, choose the highest-install relevant skill, temporarily install it for Codex, follow the installed skill's instructions to complete the part, reuse skills when possible, and remove temporary skills after the task. Use when a request spans multiple specialized areas such as review, testing, deployment, migration, documentation, or integration and a small on-demand skill set is preferable to keeping many skills installed permanently.
 ---
 
-# Dynamic Skill Router
+# fuck-skills
 
 Use this skill when a single user request may require multiple specialized skills and you want to borrow those skills temporarily instead of keeping a large permanent skill set.
 

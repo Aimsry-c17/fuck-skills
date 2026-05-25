@@ -1,4 +1,4 @@
-# Dynamic Skill Router v2 design
+# fuck-skills v2 design
 
 ## Goal
 
