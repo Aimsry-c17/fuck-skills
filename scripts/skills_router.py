@@ -2,7 +2,6 @@
 import argparse
 import json
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,17 +31,27 @@ STOPWORDS = {
 }
 
 
-def run_cmd(cmd: List[str]) -> str:
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"Command failed: {' '.join(cmd)}")
-    return result.stdout
+def run_cmd(cmd: List[str], timeout: int = 60, retries: int = 2) -> str:
+    last_error: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"Command failed: {' '.join(cmd)}")
+            return result.stdout
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"Command timed out after {timeout}s: {' '.join(cmd)}") from e
+        except RuntimeError as e:
+            last_error = e
+            if attempt < retries - 1:
+                print(f"Retrying ({attempt + 1}/{retries - 1})...", file=sys.stderr)
+    raise RuntimeError(str(last_error))
 
 
 
 def skills_exec(args: List[str]) -> str:
     cmd = ["npm", "exec", "--yes", "--package=skills", "--", "skills", *args]
-    return run_cmd(cmd)
+    return run_cmd(cmd, timeout=180, retries=2)
 
 
 
@@ -52,7 +61,7 @@ def strip_ansi(text: str) -> str:
 
 
 def parse_install_count(text: str) -> int:
-    value = (text or "").strip().upper()
+    value = (text or "").strip().upper().replace(",", "")
     if not value:
         return 0
 
@@ -95,40 +104,42 @@ def parse_find_output(output: str) -> List[Dict[str, Any]]:
     clean_output = strip_ansi(output)
     lines = [line.rstrip() for line in clean_output.splitlines() if line.strip()]
     results: List[Dict[str, Any]] = []
-    i = 0
-    pattern = re.compile(r"^(?P<pkg>[^\s]+@[^\s]+)\s+(?P<installs>[\d.]+[KMB]?)\s+installs$")
+    current: Optional[Dict[str, Any]] = None
+    pattern = re.compile(r"^(?P<pkg>[^\s]+@[^\s]+)\s+(?P<installs>[\d.,]+(?:[KMBkmb])?)\s+installs(?:\s|$)")
 
-    while i < len(lines):
-        line = lines[i].strip()
+    for raw_line in lines:
+        line = raw_line.strip()
         match = pattern.match(line)
         if match:
+            if current is not None:
+                results.append(current)
             package_ref = match.group("pkg")
             repo, skill = package_ref.rsplit("@", 1)
             installs_text = match.group("installs")
-            url = ""
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                if next_line.startswith("└ https://skills.sh/"):
-                    url = next_line.replace("└ ", "", 1)
-                    i += 1
+            current = {
+                "package": package_ref,
+                "repo": repo,
+                "skill": skill,
+                "installs_text": installs_text,
+                "installs_value": parse_install_count(installs_text),
+                "url": "",
+            }
+            continue
 
-            results.append(
-                {
-                    "package": package_ref,
-                    "repo": repo,
-                    "skill": skill,
-                    "installs_text": installs_text,
-                    "installs_value": parse_install_count(installs_text),
-                    "url": url,
-                }
-            )
-        i += 1
+        if current is not None and not current.get("url"):
+            url_match = re.search(r"https://skills\.sh/\S+", line)
+            if url_match:
+                current["url"] = url_match.group(0)
+
+    if current is not None:
+        results.append(current)
 
     return results
 
 
 
 def search_query(query: str) -> Dict[str, Any]:
+    print(f"Searching skills.sh for: {query}", file=sys.stderr)
     output = skills_exec(["find", query])
     candidates = parse_find_output(output)
     for candidate in candidates:
@@ -175,44 +186,64 @@ def build_part_context(part_title: str, capability: str, queries: List[str]) -> 
 
 
 
-def score_candidate(part_title: str, capability: str, queries: List[str], candidate: Dict[str, Any]) -> Dict[str, Any]:
-    candidate_text = " ".join(
-        [
-            candidate.get("package", ""),
-            candidate.get("repo", ""),
-            candidate.get("skill", ""),
-            candidate.get("url", ""),
-        ]
-    ).lower()
+def score_candidate(
+    part_title: str,
+    capability: str,
+    queries: List[str],
+    candidate: Dict[str, Any],
+    high_threshold: int = 80,
+    medium_threshold: int = 30,
+) -> Dict[str, Any]:
+    package_text = (candidate.get("package", "") or "").lower()
+    repo_text = (candidate.get("repo", "") or "").lower()
+    skill_text = (candidate.get("skill", "") or "").lower()
+    url_text = (candidate.get("url", "") or "").lower()
+    candidate_text = " ".join([package_text, repo_text, skill_text, url_text]).strip()
 
     part_tokens = set(tokenize(build_part_context(part_title, capability, queries)))
-    candidate_tokens = set(tokenize(candidate_text))
+    repo_tokens = set(tokenize(repo_text))
+    skill_tokens = set(tokenize(skill_text))
+    url_tokens = set(tokenize(url_text))
+    candidate_tokens = repo_tokens | skill_tokens | url_tokens
     overlap = part_tokens & candidate_tokens
 
-    score = len(overlap) * 10
+    token_score = len(overlap & skill_tokens) * 12 + len(overlap & repo_tokens) * 6 + len(overlap & url_tokens) * 3
     exact_matches = []
+    exact_score = 0
 
     for query in queries:
-        query_norm = " ".join(tokenize(query))
-        if query_norm and query_norm in candidate_text:
+        query_tokens = tokenize(query)
+        query_norm = " ".join(query_tokens)
+        if not query_norm:
+            continue
+        if query_norm in skill_text or query_norm in repo_text:
             exact_matches.append(query)
-            score += 60
+            exact_score += 40
+        elif set(query_tokens) and set(query_tokens).issubset(skill_tokens | repo_tokens):
+            exact_matches.append(query)
+            exact_score += 25
 
-    if capability:
-        cap_norm = " ".join(tokenize(capability))
-        if cap_norm and cap_norm in candidate_text:
-            score += 25
+    cap_score = 0
+    cap_tokens = set(tokenize(capability))
+    if cap_tokens and cap_tokens & (skill_tokens | repo_tokens):
+        cap_score = 20
 
-    part_norm = " ".join(tokenize(part_title))
-    if part_norm and part_norm in candidate_text:
-        score += 35
+    title_score = 0
+    title_tokens = set(tokenize(part_title))
+    if title_tokens and title_tokens & skill_tokens:
+        title_score = 25
+    elif title_tokens and title_tokens & repo_tokens:
+        title_score = 10
 
-    if candidate.get("skill", "") in (part_title or ""):
-        score += 10
+    name_score = 0
+    if title_tokens and skill_tokens and title_tokens & skill_tokens:
+        name_score = 10
 
-    if score >= 80:
+    score = token_score + exact_score + cap_score + title_score + name_score
+
+    if score >= high_threshold:
         relevance = "high"
-    elif score >= 30:
+    elif score >= medium_threshold:
         relevance = "medium"
     elif score > 0:
         relevance = "low"
@@ -224,15 +255,33 @@ def score_candidate(part_title: str, capability: str, queries: List[str], candid
         "relevance": relevance,
         "overlap_tokens": sorted(overlap),
         "exact_query_matches": exact_matches,
+        "score_breakdown": {
+            "token_overlap": token_score,
+            "token_count": len(overlap),
+            "overlap_tokens": sorted(overlap),
+            "exact_query_match": exact_score,
+            "exact_matches": exact_matches,
+            "capability_match": cap_score,
+            "title_match": title_score,
+            "skill_name_match": name_score,
+            "total": score,
+        },
     }
 
 
 
-def rank_candidates(part_title: str, capability: str, queries: List[str], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def rank_candidates(
+    part_title: str,
+    capability: str,
+    queries: List[str],
+    candidates: List[Dict[str, Any]],
+    high_threshold: int = 80,
+    medium_threshold: int = 30,
+) -> List[Dict[str, Any]]:
     ranked = []
     for candidate in candidates:
         scored = dict(candidate)
-        scored.update(score_candidate(part_title, capability, queries, candidate))
+        scored.update(score_candidate(part_title, capability, queries, candidate, high_threshold, medium_threshold))
         ranked.append(scored)
 
     ranked.sort(key=lambda item: (item["relevance_score"], item["installs_value"]), reverse=True)
@@ -249,11 +298,15 @@ def filter_relevant_candidates(ranked_candidates: List[Dict[str, Any]]) -> List[
     if low:
         return low
 
-    return ranked_candidates
+    return []
 
 
 
-def select_for_part(part: Dict[str, Any]) -> Dict[str, Any]:
+def select_for_part(
+    part: Dict[str, Any],
+    high_threshold: int = 80,
+    medium_threshold: int = 30,
+) -> Dict[str, Any]:
     part_id = part.get("part_id") or part.get("id") or part.get("title") or "part"
     title = part.get("title", "")
     capability = part.get("capability", "")
@@ -278,7 +331,7 @@ def select_for_part(part: Dict[str, Any]) -> Dict[str, Any]:
 
     search_payloads = [search_query(query) for query in queries]
     merged_candidates = merge_candidates(search_payloads)
-    ranked_candidates = rank_candidates(title, capability, queries, merged_candidates)
+    ranked_candidates = rank_candidates(title, capability, queries, merged_candidates, high_threshold, medium_threshold)
     relevant_candidates = filter_relevant_candidates(ranked_candidates)
     selected = relevant_candidates[0] if relevant_candidates else None
 
@@ -298,12 +351,16 @@ def select_for_part(part: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-def reuse_or_select(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
+def reuse_or_select(
+    parts: List[Dict[str, Any]],
+    high_threshold: int = 80,
+    medium_threshold: int = 30,
+) -> Dict[str, Any]:
     selections = []
     chosen_registry: Dict[str, Dict[str, Any]] = {}
 
     for part in parts:
-        selection = select_for_part(part)
+        selection = select_for_part(part, high_threshold, medium_threshold)
         selected = selection.get("selected")
 
         if selection.get("fallback") or not selected:
@@ -318,9 +375,18 @@ def reuse_or_select(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         for package, existing in chosen_registry.items():
             existing_scored = dict(existing)
-            existing_scored.update(score_candidate(title, capability, queries, existing))
-            if existing_scored.get("relevance_score", 0) >= top_score and existing_scored.get("relevance_score", 0) > 0:
-                if reuse_choice is None or existing_scored["relevance_score"] > reuse_choice["relevance_score"]:
+            existing_scored.update(
+                score_candidate(title, capability, queries, existing, high_threshold, medium_threshold)
+            )
+            existing_score = existing_scored.get("relevance_score", 0)
+            exact_matches = existing_scored.get("exact_query_matches", [])
+            has_strong_signal = bool(exact_matches) or existing_scored.get("score_breakdown", {}).get("capability_match", 0) > 0
+            if (
+                existing_score >= top_score
+                and existing_score >= medium_threshold
+                and has_strong_signal
+            ):
+                if reuse_choice is None or existing_score > reuse_choice["relevance_score"]:
                     reuse_choice = existing_scored
 
         if reuse_choice is not None:
@@ -340,26 +406,271 @@ def reuse_or_select(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 
+def split_package_ref(package: str) -> Tuple[str, str]:
+    if "@" not in package:
+        raise RuntimeError("package must look like owner/repo@skill-name")
+    return package.rsplit("@", 1)
+
+
+
+def normalize_installed_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(item)
+    repo = item.get("repo") or item.get("owner_repo")
+    skill_name = item.get("name") or item.get("skill")
+    package = item.get("package")
+
+    path = item.get("path") or ""
+    if (not repo or not package) and path:
+        resolved = Path(path)
+        parts = resolved.parts
+        if "skills" in parts:
+            idx = parts.index("skills")
+            if idx + 2 < len(parts):
+                repo = repo or f"{parts[idx + 1]}/{parts[idx + 2]}"
+                if idx + 3 < len(parts):
+                    skill_name = skill_name or parts[idx + 3]
+        elif ".skills" in parts:
+            idx = parts.index(".skills")
+            if idx + 2 < len(parts):
+                repo = repo or f"{parts[idx + 1]}/{parts[idx + 2]}"
+                if idx + 3 < len(parts):
+                    skill_name = skill_name or parts[idx + 3]
+
+    if repo and skill_name and not package:
+        package = f"{repo}@{skill_name}"
+
+    normalized["repo"] = repo
+    normalized["skill"] = skill_name
+    normalized["package"] = package
+    return normalized
+
+
+
 def list_installed() -> List[Dict[str, Any]]:
     output = skills_exec(["ls", "-g", "-a", "codex", "--json"])
     return json.loads(output)
 
 
 
-def find_installed_skill(skill_name: str) -> Optional[Dict[str, Any]]:
+def find_installed_by_package(package: str) -> Optional[Dict[str, Any]]:
+    repo, skill_name = split_package_ref(package)
+    skill_name_matches: List[Dict[str, Any]] = []
     for item in list_installed():
-        if item.get("name") == skill_name:
-            return item
+        normalized = normalize_installed_item(item)
+        if normalized.get("package") == package:
+            return normalized
+        if normalized.get("repo") == repo and normalized.get("skill") == skill_name:
+            return normalized
+        if normalized.get("skill") == skill_name or normalized.get("name") == skill_name:
+            skill_name_matches.append(normalized)
+
+    if len(skill_name_matches) == 1:
+        return skill_name_matches[0]
     return None
+
+
+
+def find_installed_by_skill_name(skill_name: str) -> List[Dict[str, Any]]:
+    matches = []
+    for item in list_installed():
+        normalized = normalize_installed_item(item)
+        if normalized.get("name") == skill_name or normalized.get("skill") == skill_name:
+            matches.append(normalized)
+    return matches
+
+
+
+def resolve_installed_target(identifier: str) -> Dict[str, Any]:
+    if "@" in identifier:
+        existing = find_installed_by_package(identifier)
+        if existing is None:
+            raise RuntimeError(f"Installed skill '{identifier}' was not found")
+        return existing
+
+    matches = find_installed_by_skill_name(identifier)
+    if not matches:
+        raise RuntimeError(f"Installed skill '{identifier}' was not found")
+    if len(matches) > 1:
+        packages = [item.get("package") or item.get("name") for item in matches]
+        raise RuntimeError(
+            "Ambiguous installed skill name. Use owner/repo@skill-name instead: " + ", ".join(packages)
+        )
+    return matches[0]
+
+
+
+def validate_part(part: Dict[str, Any], index: int) -> Dict[str, Any]:
+    normalized = dict(part)
+    part_id = normalized.get("part_id") or normalized.get("id") or f"part-{index + 1}"
+    title = normalized.get("title")
+    capability = normalized.get("capability") or ""
+    needs_skill = normalized.get("needs_skill", True)
+    queries = normalized.get("queries", [])
+
+    if not isinstance(title, str) or not title.strip():
+        raise RuntimeError(f"Part '{part_id}' must include a non-empty title")
+    if not isinstance(capability, str):
+        raise RuntimeError(f"Part '{part_id}' capability must be a string")
+    if not isinstance(needs_skill, bool):
+        raise RuntimeError(f"Part '{part_id}' needs_skill must be a boolean")
+    if not isinstance(queries, list) or any(not isinstance(query, str) or not query.strip() for query in queries):
+        raise RuntimeError(f"Part '{part_id}' queries must be a list of non-empty strings")
+    if needs_skill and not queries:
+        raise RuntimeError(f"Part '{part_id}' has no queries")
+
+    normalized["part_id"] = part_id
+    normalized["title"] = title.strip()
+    normalized["capability"] = capability.strip()
+    normalized["needs_skill"] = needs_skill
+    normalized["queries"] = unique_keep_order([query.strip() for query in queries])
+    return normalized
+
+
+
+def summarize_plan(parts: List[Dict[str, Any]], installed_items: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    packages_to_install = []
+    already_installed_packages = []
+    fallback_parts = []
+    reused_parts = []
+    installed_packages = {
+        item.get("package")
+        for item in (installed_items or [])
+        if item.get("package")
+    }
+
+    for part in parts:
+        selected = part.get("selected")
+        if part.get("fallback") or not selected:
+            fallback_parts.append(part.get("part_id"))
+            continue
+        if part.get("reused"):
+            reused_parts.append(part.get("part_id"))
+            continue
+        package = selected.get("package")
+        if not package:
+            continue
+        if package in installed_packages:
+            if package not in already_installed_packages:
+                already_installed_packages.append(package)
+        elif package not in packages_to_install:
+            packages_to_install.append(package)
+
+    return {
+        "parts_total": len(parts),
+        "packages_to_install": packages_to_install,
+        "already_installed_packages": already_installed_packages,
+        "fallback_parts": fallback_parts,
+        "reused_parts": reused_parts,
+    }
 
 
 
 def load_parts_from_args(args: argparse.Namespace) -> List[Dict[str, Any]]:
     if args.parts_file:
-        return json.loads(Path(args.parts_file).read_text())
-    if args.parts_json:
-        return json.loads(args.parts_json)
-    raise RuntimeError("Provide --parts-file or --parts-json")
+        parts = json.loads(Path(args.parts_file).read_text(encoding="utf-8"))
+    elif args.parts_json:
+        parts = json.loads(args.parts_json)
+    else:
+        raise RuntimeError("Provide --parts-file or --parts-json")
+
+    if not isinstance(parts, list):
+        raise RuntimeError("Parts input must be a JSON array")
+
+    return [validate_part(part, index) for index, part in enumerate(parts)]
+
+
+
+def format_text_payload(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload
+
+    if isinstance(payload, list):
+        if not payload:
+            return "(empty)"
+        lines = []
+        for item in payload:
+            if isinstance(item, dict):
+                package = item.get("package") or item.get("name") or item.get("skill") or "item"
+                path = item.get("path")
+                scope = item.get("scope")
+                line = package
+                extras = [value for value in [scope, path] if value]
+                if extras:
+                    line += " | " + " | ".join(extras)
+                lines.append(line)
+            else:
+                lines.append(str(item))
+        return "\n".join(lines)
+
+    if not isinstance(payload, dict):
+        return str(payload)
+
+    if "checks" in payload:
+        lines = []
+        for check in payload.get("checks", []):
+            if check.get("status") == "ok":
+                lines.append(f"[ok] {check.get('name')}: {check.get('version', '')}".rstrip())
+            else:
+                lines.append(f"[fail] {check.get('name')}: {check.get('error', '')}".rstrip())
+        lines.append(f"all_ok={payload.get('all_ok')}")
+        return "\n".join(lines)
+
+    if "parts" in payload and isinstance(payload.get("parts"), list):
+        lines = []
+        for part in payload["parts"]:
+            selected = part.get("selected")
+            if selected:
+                lines.append(
+                    f"{part.get('part_id')}: {part.get('title')} -> {selected.get('package')} "
+                    f"[{selected.get('relevance')}:{selected.get('relevance_score')}]"
+                    + (" (reused)" if part.get("reused") else "")
+                )
+            else:
+                lines.append(f"{part.get('part_id')}: {part.get('title')} -> fallback")
+        summary = payload.get("summary")
+        if isinstance(summary, dict):
+            lines.append(f"packages_to_install={', '.join(summary.get('packages_to_install', [])) or '-'}")
+            lines.append(f"already_installed_packages={', '.join(summary.get('already_installed_packages', [])) or '-'}")
+            lines.append(f"fallback_parts={', '.join(summary.get('fallback_parts', [])) or '-'}")
+            lines.append(f"reused_parts={', '.join(summary.get('reused_parts', [])) or '-'}")
+        return "\n".join(lines)
+
+    if "query" in payload and "results" in payload and isinstance(payload.get("results"), list):
+        lines = [f"query={payload.get('query')}"]
+        if payload["results"]:
+            lines.extend(
+                f"{item.get('package')} | {item.get('installs_text')} | queries={','.join(item.get('matched_queries', []))}"
+                for item in payload["results"]
+            )
+        else:
+            lines.append("(empty)")
+        return "\n".join(lines)
+
+    if "results" in payload and isinstance(payload.get("results"), list):
+        return "\n".join(
+            f"{item.get('package')} | {item.get('installs_text')} | queries={','.join(item.get('matched_queries', []))}"
+            for item in payload["results"]
+        ) or "(empty)"
+
+    if "selected" in payload or "fallback" in payload:
+        selected = payload.get("selected")
+        if selected:
+            return (
+                f"{payload.get('part_id')}: {payload.get('title')} -> {selected.get('package')} "
+                f"[{selected.get('relevance')}:{selected.get('relevance_score')}]"
+            )
+        return f"{payload.get('part_id')}: {payload.get('title')} -> fallback"
+
+    if "package" in payload and "already_installed_before" in payload:
+        return (
+            f"installed {payload.get('package')} | already_installed_before={payload.get('already_installed_before')} "
+            f"| path={payload.get('installed_path') or '-'}"
+        )
+
+    if "removed" in payload and "package" in payload:
+        return f"removed {payload.get('package')} | removed={payload.get('removed')} | mode={payload.get('cleanup_mode')}"
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 
@@ -367,10 +678,7 @@ def print_payload(payload: Any, as_json: bool) -> None:
     if as_json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        if isinstance(payload, str):
-            print(payload)
-        else:
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(format_text_payload(payload))
 
 
 
@@ -401,34 +709,37 @@ def cmd_select(args: argparse.Namespace) -> None:
         "queries": unique_keep_order(args.query),
         "needs_skill": True,
     }
-    payload = select_for_part(part)
+    payload = select_for_part(part, args.relevance_high, args.relevance_medium)
     print_payload(payload, args.json)
 
 
 
 def cmd_batch_select(args: argparse.Namespace) -> None:
     parts = load_parts_from_args(args)
-    payload = reuse_or_select(parts)
+    payload = reuse_or_select(parts, args.relevance_high, args.relevance_medium)
+    installed_items = [normalize_installed_item(item) for item in list_installed()]
+    payload["summary"] = summarize_plan(payload.get("parts", []), installed_items)
+    if args.dry_run:
+        payload["mode"] = "dry_run"
+        payload["message"] = "Dry run — no skills will be installed. Review the plan below."
     print_payload(payload, args.json)
 
 
 
 def cmd_install(args: argparse.Namespace) -> None:
-    if "@" not in args.package:
-        raise RuntimeError("package must look like owner/repo@skill-name")
-
-    repo, skill_name = args.package.rsplit("@", 1)
-    existing = find_installed_skill(skill_name)
+    repo, skill_name = split_package_ref(args.package)
+    existing = find_installed_by_package(args.package)
     already_installed_before = existing is not None
 
     if not already_installed_before:
         skills_exec(["add", repo, "--skill", skill_name, "-g", "-a", "codex", "-y"])
 
-    installed = find_installed_skill(skill_name)
+    installed = find_installed_by_package(args.package)
     if not installed:
-        raise RuntimeError(f"Installed skill '{skill_name}' was not found in Codex global skills")
+        raise RuntimeError(f"Installed skill '{args.package}' was not found in Codex global skills")
 
     payload = {
+        "package": args.package,
         "repo": repo,
         "skill": skill_name,
         "already_installed_before": already_installed_before,
@@ -441,25 +752,26 @@ def cmd_install(args: argparse.Namespace) -> None:
 
 
 def cmd_remove(args: argparse.Namespace) -> None:
-    existing = find_installed_skill(args.skill_name)
+    existing = resolve_installed_target(args.skill_ref)
+    target_identifier = existing.get("package") or args.skill_ref
+    path = existing.get("path")
+    skill_name = existing.get("skill") or existing.get("name") or args.skill_ref
+
+    skills_exec(["remove", "--global", skill_name, "-y"])
+
     removed = False
-    path = existing.get("path") if existing else None
+    if "@" in args.skill_ref:
+        removed = find_installed_by_package(args.skill_ref) is None
+    else:
+        removed = len(find_installed_by_skill_name(skill_name)) == 0
 
-    if existing:
-        skills_exec(["remove", "--global", args.skill_name, "-y"])
-        removed = True
-        remaining = find_installed_skill(args.skill_name)
-        if remaining:
-            remaining_path = Path(remaining.get("path", ""))
-            if remaining_path.exists() and remaining_path.is_symlink():
-                remaining_path.unlink()
-
-    if path:
-        p = Path(path)
-        if p.exists() and not p.is_symlink():
-            shutil.rmtree(p)
-
-    payload = {"skill": args.skill_name, "removed": removed, "path": path}
+    payload = {
+        "skill": skill_name,
+        "package": target_identifier,
+        "removed": removed,
+        "path": path,
+        "cleanup_mode": "cli_only",
+    }
     print_payload(payload, args.json)
 
 
@@ -467,6 +779,60 @@ def cmd_remove(args: argparse.Namespace) -> None:
 def cmd_list(args: argparse.Namespace) -> None:
     payload = list_installed()
     print_payload(payload, args.json)
+
+
+def run_check(cmd: List[str], help_text: str, name: str) -> Dict[str, Any]:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return {"name": name, "status": "fail", "error": str(e), "help": help_text}
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        return {
+            "name": name,
+            "status": "fail",
+            "error": stderr or stdout or f"Command failed with exit code {result.returncode}",
+            "help": help_text,
+        }
+
+    return {"name": name, "status": "ok", "version": stdout or stderr}
+
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    results: Dict[str, Any] = {"checks": []}
+
+    checks_to_run: List[Dict[str, Any]] = [
+        {
+            "name": "node",
+            "cmd": ["node", "--version"],
+            "help": "Install Node.js from https://nodejs.org (LTS recommended)",
+        },
+        {
+            "name": "npm",
+            "cmd": ["npm", "--version"],
+            "help": "npm is bundled with Node.js",
+        },
+        {
+            "name": "skills",
+            "cmd": ["npm", "exec", "--yes", "--package=skills", "--", "skills", "--version"],
+            "help": "The skills CLI is fetched on-demand; check your network connection",
+        },
+        {
+            "name": "python3",
+            "cmd": ["python3", "--version"],
+            "help": "Python 3 is required to run this helper script",
+        },
+    ]
+
+    for check in checks_to_run:
+        print(f"Checking {check['name']}...", file=sys.stderr)
+        results["checks"].append(run_check(check["cmd"], check["help"], check["name"]))
+
+    results["all_ok"] = all(c["status"] == "ok" for c in results["checks"])
+    print_payload(results, args.json)
 
 
 
@@ -490,12 +856,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_select.add_argument("--capability")
     p_select.add_argument("--query", action="append", required=True)
     p_select.add_argument("--json", action="store_true")
+    p_select.add_argument("--relevance-high", type=int, default=80, help="Score threshold for high relevance (default: 80)")
+    p_select.add_argument("--relevance-medium", type=int, default=30, help="Score threshold for medium relevance (default: 30)")
     p_select.set_defaults(func=cmd_select)
 
     p_batch = sub.add_parser("batch-select")
     p_batch.add_argument("--parts-file")
     p_batch.add_argument("--parts-json")
     p_batch.add_argument("--json", action="store_true")
+    p_batch.add_argument("--relevance-high", type=int, default=80, help="Score threshold for high relevance (default: 80)")
+    p_batch.add_argument("--relevance-medium", type=int, default=30, help="Score threshold for medium relevance (default: 30)")
+    p_batch.add_argument("--dry-run", action="store_true", help="Preview the plan without installing any skills")
     p_batch.set_defaults(func=cmd_batch_select)
 
     p_install = sub.add_parser("install")
@@ -504,13 +875,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_install.set_defaults(func=cmd_install)
 
     p_remove = sub.add_parser("remove")
-    p_remove.add_argument("skill_name")
+    p_remove.add_argument("skill_ref")
     p_remove.add_argument("--json", action="store_true")
     p_remove.set_defaults(func=cmd_remove)
 
     p_list = sub.add_parser("list")
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_list)
+
+    p_check = sub.add_parser("check")
+    p_check.add_argument("--json", action="store_true")
+    p_check.set_defaults(func=cmd_check)
 
     return parser
 

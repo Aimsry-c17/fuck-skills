@@ -7,256 +7,232 @@ description: Analyze a user request, decompose it into ordered capability parts,
 
 Use this skill when a single user request may require multiple specialized skills and you want to borrow those skills temporarily instead of keeping a large permanent skill set.
 
-## Core idea
+**`<skill_dir>`** in all commands below means the directory containing this SKILL.md file.
 
-Do not treat the whole request as a single search target. Instead:
+## When NOT to use this skill
+
+Skip this skill entirely when the request is:
+
+- a single straightforward task (typo fix, simple explanation, basic refactor)
+- completable with built-in tools alone
+- too trivial for any community skill to add meaningful value
+
+For a single-part request that DOES need an external skill, use the fast path: `search` → `install` → use → `remove`. Skip the full batch workflow.
+
+## Prerequisites
+
+Verify the runtime environment:
+
+```bash
+python3 <skill_dir>/scripts/skills_router.py check --json
+```
+
+If any check fails, the output includes a `help` field with installation guidance.
+
+### Required permissions
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm *)",
+      "Bash(python3 *)"
+    ]
+  }
+}
+```
+
+Without these, every `skills` search and install call triggers a permission prompt, defeating the automation purpose.
+
+## Core idea
 
 1. split the request into ordered capability parts
 2. decide which parts actually need an external skill
-3. search `skills.sh` separately for each skill-worthy part
-4. choose the highest-install relevant skill for each part
-5. reuse a selected skill across multiple parts when it already covers them well
+3. search `skills.sh` for each skill-worthy part
+4. select the highest-install relevant skill for each part
+5. reuse skills across parts when they already cover the new part well
 6. clean up temporary skills after the full task is complete
 
 ## Workflow
 
+### 0. Preview the plan (always do this first)
+
+Before installing anything, decompose the request and run a dry-run to show the user what will happen:
+
+**Step 0a — Decompose and build the parts JSON.** Each part needs these fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `part_id` | yes | unique id, e.g. `"p1"`, `"p2"` |
+| `title` | yes | short description, e.g. `"Review PR for security"` |
+| `capability` | no | category: `review`, `testing`, `deployment`, `documentation`, `refactor`, `analysis`, `migration`, `integration` |
+| `queries` | yes | 1-3 search terms for skills.sh, e.g. `["pr review", "security review"]` |
+| `needs_skill` | yes | `true` if an external skill is justified, `false` otherwise |
+
+**Step 0b — Run batch-select with --dry-run:**
+
+```bash
+python3 <skill_dir>/scripts/skills_router.py batch-select \
+  --parts-json '[{"part_id":"p1","title":"Review PR for security","capability":"review","queries":["pr review","security review"],"needs_skill":true},{"part_id":"p2","title":"Add test coverage","capability":"testing","queries":["test coverage","unit testing"],"needs_skill":true},{"part_id":"p3","title":"Generate changelog","capability":"documentation","queries":["changelog","release notes"],"needs_skill":true}]' \
+  --dry-run --json
+```
+
+**Step 0c — Present the plan to the user:**
+- each part: title, selected skill (package + install count + relevance score), whether reused
+- the `summary.packages_to_install` list for newly installed skills
+- the `summary.already_installed_packages` list for skills that are already present
+- any fallback parts from `summary.fallback_parts`
+
+**Step 0d — Wait for user confirmation before proceeding.**
+
 ### 1. Decompose the request into ordered parts
 
-Break the user request into a short list of ordered parts. Each part should represent an independent capability, not just a sentence fragment.
+Break the request by capability, not by sentence. Prefer capabilities like: review, testing, deployment, documentation, refactor, analysis, migration, integration.
 
-Prefer parts such as:
+Good: part 1: review PR → part 2: add tests → part 3: write changelog
+Bad: splitting every sentence or grammar fragment
 
-- review
-- testing
-- deployment
-- documentation
-- refactor
-- analysis
-- migration
-- integration
-
-Good example:
-
-- part 1: review the PR
-- part 2: add test coverage
-- part 3: write the changelog
-
-Bad example:
-
-- split every sentence into tiny pieces
-- split by grammar rather than by capability
-
-Preserve execution order. Some requests require a strict sequence such as review -> change -> test -> document.
+Preserve execution order when the request implies a sequence (review → change → test → document).
 
 ### 2. Decide which parts need an external skill
 
-For each part, decide whether routing is justified.
+Set `needs_skill=true` when the part is specialized enough that a community skill provides meaningful leverage and no built-in or local skill is a good fit.
 
-Set `needs_skill=true` only when the part is specialized enough that a community skill may provide meaningful leverage and no currently available built-in or local skill is already a good fit.
+Set `needs_skill=false` for: small text edits, simple refactors, basic explanations, trivial formatting.
 
-Set `needs_skill=false` when the part is simple, generic, already covered locally, or cheaper to solve directly.
+**Prefer:** framework-specific best practices, PR review workflows, testing playbooks, deployment guides, changelog/release-note generators, migration procedures.
 
-Examples of parts that often justify external skills:
-
-- framework-specific best practices
-- PR review workflows
-- testing playbooks
-- deployment guides
-- changelog or release note generation
-- migration procedures
-
-Examples of parts that usually do not justify external skills:
-
-- small text edits
-- simple refactors
-- basic explanations
-- trivial formatting tasks
+**Avoid:** huge umbrella repos when a focused skill exists, vague low-signal matches, skills implying risky production actions without review, skills duplicating common knowledge, overlapping skills when one covers multiple adjacent parts.
 
 ### 3. Generate queries for each skill-worthy part
 
-For every part with `needs_skill=true`, create 1-3 focused queries.
+Create 1-3 focused queries per part. Patterns: `<domain> <task>`, `<tool> <task>`, `<capability> best practices`, `<framework> workflow`.
 
-Prefer combinations like:
+Examples: `pr review`, `react testing`, `jest testing`, `release notes`, `vercel deploy`.
 
-- `<domain> <task>`
-- `<tool> <task>`
-- `<capability> best practices`
-- `<framework> workflow`
+### 4. Search and select
 
-Examples:
+Run `batch-select` as shown in Step 0b. The script: searches skills.sh for each part's queries, merges/deduplicates candidates, scores by relevance, selects the best skill per part, and detects reuse opportunities — all at once.
 
-- `pr review`
-- `react testing`
-- `jest testing`
-- `release notes`
-- `vercel deploy`
-
-Do not over-expand queries. A few focused searches are better than broad, noisy exploration.
-
-### 4. Search skills.sh for each part
-
-Use the helper script:
+For debugging a single part, use `select`:
 
 ```bash
-python3 <skill_dir>/scripts/skills_router.py search "<query>" --json
+python3 <skill_dir>/scripts/skills_router.py select \
+  --part-title "Review PR" --capability "review" \
+  --query "pr review" --query "code review" --json
 ```
 
-Search separately for each part, not just once for the full request. Merge candidates across that part's queries and deduplicate by skill.
+#### Selection rule
 
-Record for each candidate:
+Candidates are sorted by `(relevance_score, installs_value)` descending — **relevance first, then popularity**. This is "hottest RELEVANT skill for this part", not "hottest skill overall".
 
-- package
-- repo
-- skill
-- installs
-- url
-- which queries matched it
+The `score_breakdown` in the output shows exactly how each candidate was scored (token overlap, exact query match, capability match, title match). Use this to explain selections to the user.
 
-## Selection rule
-
-Always use this order:
-
-1. filter for relevance to the current part
-2. among the relevant candidates, prefer the highest-install skill
-
-This is **not** "globally hottest skill wins". It is "highest-install relevant skill for this specific part wins".
-
-If top candidates are close in popularity but imply different approaches, ask the user to choose. Otherwise select the top relevant skill automatically and explain why.
+If top candidates have similar scores but imply different approaches, ask the user to choose.
 
 ### 5. Reuse skills when possible
 
-Before installing a new skill for a later part, check whether an already selected skill can cover that part well enough.
+Reuse is automatic in `batch-select`: if a previously selected skill scores >= the best new candidate for the current part, it is reused instead of installing another. The output marks reused parts with `"reused": true`.
 
-Prefer reuse when:
+Do not manually install a duplicate when `batch-select` already determined reuse.
 
-- the earlier skill already covers the capability
-- reuse will not noticeably reduce quality
-- the new part does not need a clearly more specialized skill
+### 6. Install the selected skills
 
-Avoid redundant installation when one skill can reasonably cover adjacent parts.
-
-### 6. Install temporarily for Codex
-
-Install only the selected skill for the current part:
+After user confirms the plan, for each non-reused, non-fallback part, install the selected skill:
 
 ```bash
 python3 <skill_dir>/scripts/skills_router.py install "<owner/repo@skill>" --json
 ```
 
-Important rules:
+Read the output and note:
+- `already_installed_before` — if `true`, do NOT remove this skill during cleanup
+- `installed_path` — where to find SKILL.md in the next step
 
-- install globally for `codex`
-- install only the selected skill, not whole bundles indiscriminately
-- record whether the skill already existed before installation
-- do not remove skills that existed before the current task
-- prefer unified cleanup at the end of the full request, not immediate cleanup after every part
+Install globally for codex. Install only the selected skill, not whole bundles.
 
-The helper script reports:
+### 7. Use the installed skill
 
-- `repo`
-- `skill`
-- `already_installed_before`
-- `installed_path`
+Newly installed skills cannot be hot-loaded by the runtime. Treat them as temporary knowledge packages:
 
-### 7. Use the installed skill by reading its files directly
+1. **Read** `{installed_path}/SKILL.md` — understand what this skill does
+2. **List** `{installed_path}/` — see what else is available (scripts/, references/, agents/)
+3. **Read only** the references relevant to the current part — do not load the entire repo into context
+4. **Execute only** the scripts relevant to the current part
+5. **Follow** the skill's workflow where it is precise; use judgment where it is vague
+6. **Record** what was completed with which skill
 
-After installation, read the installed skill's `SKILL.md` from the reported `installed_path`.
-
-Then:
-
-1. follow its workflow where it is precise
-2. read only the references needed for the current part
-3. execute only the scripts relevant to that part
-4. avoid loading the whole installed repository into context
-5. record what part was completed with which skill
-
-## Important limitation
-
-Newly installed skills may not become immediately available to the runtime skill loader in the same turn. Therefore, do **not** rely on hot-loading the installed skill through the platform's native skill invocation path.
-
-Treat installed skills as temporary knowledge packages:
-
-1. install them
-2. read `SKILL.md`
-3. selectively read references or run scripts
-4. complete the target part
-5. clean them up later if they were installed only for this task
-
-This still achieves the goal of temporary skill acquisition, use, and disposal.
+If the installed skill turns out to be weak, vague, or irrelevant: try the next candidate from the `candidates` list in the batch-select output, or fall back to direct execution.
 
 ### 8. Execute parts in order
 
-Run the request as an ordered sequence of parts.
+For each part in the batch-select output:
 
-For each part:
-
-1. determine whether a selected or reusable skill applies
-2. install it if needed
-3. use its instructions to complete the part
-4. mark the part complete
-5. continue to the next part
+1. Check `selected` — if null, this part is a fallback; solve it directly
+2. Check `reused` — if true, use the already-installed skill from `reused_from_package`; skip installation
+3. If `reused` is false and `selected` is non-null: run `install`, then Step 7
+4. Complete the part using the skill's guidance
+5. Move to the next part
 
 Do not reorder parts unless the user explicitly prefers a different plan.
 
 ### 9. Clean up after the full task
 
-Prefer unified cleanup after the whole request is complete.
-
-If and only if `already_installed_before` is `false`, remove the skill after all relevant parts are done:
+After ALL parts are complete, remove each skill that was installed specifically for this task:
 
 ```bash
-python3 <skill_dir>/scripts/skills_router.py remove "<skill-name>" --json
+python3 <skill_dir>/scripts/skills_router.py remove "<owner/repo@skill-name>" --json
 ```
 
-Do not remove the skill when:
+Prefer passing the full package reference for cleanup. `remove "<skill-name>"` is kept only for backward compatibility and will fail if multiple installed skills share the same name.
 
-- the full task is incomplete
-- the user asks to keep it installed
-- the skill existed before this workflow started
-- a later part still needs it
+Only remove skills where `already_installed_before` was `false`. Keep skills that: existed before this task, the user asked to keep, or are still needed by a pending part.
 
 ### 10. Fallback rules
 
-If no strong relevant skill exists for a part, solve that part directly.
+- No strong relevant candidate → solve the part directly without an external skill
+- Installation fails → explain, try the next candidate, or solve directly
+- Selected skill is too weak/vague → try the next candidate from `candidates`, or solve directly
+- Cleanup is handled through `skills remove`; do not manually delete skill directories from this router
 
-If installation fails, explain the failure, continue with the next best option when reasonable, or solve the part without the external skill.
+### 11. Report at the end
 
-If the selected skill turns out to be too weak or too vague, try the next relevant candidate or fall back to direct execution.
-
-### 11. Report clearly
-
-Tell the user:
-
-- how you decomposed the request
-- which parts needed skills and which did not
-- which queries you used for each part
-- which skills were selected and why
-- whether any skills were reused across parts
-- which skills were newly installed
-- which skills were cleaned up afterward
-- any limitations, weak matches, or fallback decisions
+Summarize: how you decomposed the request, which parts used skills vs fallback, which skills were selected and why, which were reused, which were newly installed, which were cleaned up, and any limitations or weak matches.
 
 ## Safety rules
 
-- Do not install many uncertain skills just to explore.
-- Prefer the smallest relevant skill for each part.
-- Do not use external skills for destructive or production-sensitive actions without explicit confirmation.
-- Prefer relevance first, popularity second.
-- Avoid repeatedly installing and removing the same skill within one request.
+- Do not install many uncertain skills just to explore
+- Prefer the smallest relevant skill for each part
+- Do not use external skills for destructive or production-sensitive actions without explicit confirmation
+- Prefer relevance first, popularity second
+- Avoid repeatedly installing and removing the same skill within one request
 
 ## Useful commands
 
-Replace `<skill_dir>` with the absolute path of this skill folder.
-
 ```bash
+# Check prerequisites
+python3 <skill_dir>/scripts/skills_router.py check --json
+
+# Search for a single query
 python3 <skill_dir>/scripts/skills_router.py search "pr review" --json
-python3 <skill_dir>/scripts/skills_router.py search "react testing" --json
-python3 <skill_dir>/scripts/skills_router.py install "wshobson/agents@typescript-advanced-types" --json
-python3 <skill_dir>/scripts/skills_router.py remove "typescript-advanced-types" --json
+
+# Full batch selection with preview (no installation)
+python3 <skill_dir>/scripts/skills_router.py batch-select \
+  --parts-json '[{"part_id":"p1","title":"Review PR","capability":"review","queries":["pr review"],"needs_skill":true}]' \
+  --dry-run --json
+
+# Install and remove
+python3 <skill_dir>/scripts/skills_router.py install "owner/repo@skill-name" --json
+python3 <skill_dir>/scripts/skills_router.py remove "owner/repo@skill-name" --json
+
+# List installed skills
 python3 <skill_dir>/scripts/skills_router.py list --json
+
+# Tune relevance thresholds (default: high=80, medium=30)
+python3 <skill_dir>/scripts/skills_router.py select \
+  --part-title "PR review" --query "code review" \
+  --relevance-high 70 --relevance-medium 25 --json
 ```
 
 ## Read next when needed
 
 - For ranking, decomposition, and data-model details, read `references/v2-design.md`.
-- For practical selection heuristics, read `references/selection-heuristics.md`.
